@@ -6,6 +6,8 @@ using Dalamud.Game.ClientState.Objects;
 using FFXIVClientStructs.FFXIV.Component.GUI;
 using FFXIVClientStructs.FFXIV.Client.UI.Agent;
 using Dalamud.Game;
+using Dalamud.Game.Chat;
+using Dalamud.Interface.Windowing;
 using Dalamud.Game.Text;
 using Dalamud.Game.Text.SeStringHandling;
 using FFXIVClientStructs.FFXIV.Client.UI;
@@ -17,6 +19,7 @@ using System.Text.RegularExpressions;
 using FFXIVClientStructs.FFXIV.Client.Game;
 using Lumina.Excel.Sheets;
 using System;
+using System.Threading;
 
 
 namespace GIllionaire;
@@ -38,14 +41,28 @@ public sealed class Plugin : IDalamudPlugin
 
     private int remainingGil = 0;
     private bool isTradeInProgress = false;
+    private readonly WindowSystem windowSystem = new("Gillionaire");
+    private readonly MainWindow mainWindow;
+    private CancellationTokenSource tradeCancellation = new();
+
+    internal int RemainingGil => remainingGil;
+    internal bool IsTradeInProgress => isTradeInProgress;
+    internal bool HasTarget => TargetManager.Target != null;
+    internal string StatusMessage { get; private set; } = "Ready.";
+
     public Plugin()
     {
         ECommonsMain.Init(PluginInterface, this);
+        mainWindow = new MainWindow(this);
+        windowSystem.AddWindow(mainWindow);
         ChatGui.ChatMessage += OnChatMessage;
         Framework.Update += SelectYes;
+        PluginInterface.UiBuilder.Draw += windowSystem.Draw;
+        PluginInterface.UiBuilder.OpenMainUi += ToggleMainUi;
+        PluginInterface.UiBuilder.OpenConfigUi += ToggleMainUi;
         CommandManager.AddHandler("/giltrade", new CommandInfo(OnCommand)
         {
-            HelpMessage = "Starts automated gil trading: /giltrade <amount>"
+            HelpMessage = "Open the Gillionaire window or start trading immediately: /giltrade [amount]"
         });
 
         Log.Information($"===Gillionaire Loaded===");
@@ -55,66 +72,92 @@ public sealed class Plugin : IDalamudPlugin
     {
         if (isTradeInProgress)
         {
-            var addon = (AddonSelectYesno*)GameGui.GetAddonByName("SelectYesno");
-            if (addon == null) return;
-            new AddonMaster.SelectYesno(addon).Yes();
+            var addon = GameGui.GetAddonByName("SelectYesno");
+            if (addon.IsNull) return;
+            new AddonMaster.SelectYesno(addon.Address).Yes();
         }
     }
 
-    private void OnChatMessage(XivChatType type, int timestamp, ref SeString sender, ref SeString message, ref bool isHandled)
+    private void OnChatMessage(IHandleableChatMessage chatMessage)
     {
         // Hacky way to check if the trade is complete
         // TODO: Replace with a more reliable method
-        if (message.TextValue.Contains("Trade complete.") && isTradeInProgress)
+        if (chatMessage.Message.TextValue.Contains("Trade complete.") && isTradeInProgress)
         {
-            isTradeInProgress = false;
-            if (remainingGil > 0)
-            {
-                // Wait a moment before starting next trade
-                var timer = new System.Timers.Timer(500);
-                timer.AutoReset = false;
-                timer.Start();
-                timer.Elapsed += (sender, e) =>
-                {
-                    StartNextTrade();
-                };
-            }
-            else
-            {
-                Log.Information("Gil trading completed successfully.");
-            }
+            CompleteCurrentTrade();
         }
-        else if (message.TextValue.Contains("Trade canceled."))
+        else if (chatMessage.Message.TextValue.Contains("Trade canceled."))
         {
-            isTradeInProgress = false;
-            remainingGil = 0;
-            Log.Information("Gil trading canceled.");
+            CancelTrade("Gil trading canceled.");
         }
+    }
+
+    internal unsafe bool TryStartTrade(int gilAmount)
+    {
+        if (gilAmount <= 0)
+        {
+            StatusMessage = "Enter a positive gil amount.";
+            return false;
+        }
+        if (TargetManager.Target == null)
+        {
+            StatusMessage = "No target selected. Target a player first.";
+            return false;
+        }
+
+        var currentGil = InventoryManager.Instance()->GetGil();
+        if (gilAmount > currentGil)
+        {
+            StatusMessage = "You do not have enough gil for this trade.";
+            return false;
+        }
+        if (isTradeInProgress)
+        {
+            StatusMessage = "A trade sequence is already running.";
+            return false;
+        }
+
+        tradeCancellation.Cancel();
+        tradeCancellation.Dispose();
+        tradeCancellation = new CancellationTokenSource();
+        remainingGil = gilAmount;
+        StatusMessage = $"Starting trade sequence for {gilAmount:N0} gil.";
+        Log.Information($"Starting trade sequence for {gilAmount} gil");
+        StartNextTrade();
+        return true;
+    }
+
+    internal void CancelTrade(string message = "Trade sequence canceled.")
+    {
+        tradeCancellation.Cancel();
+        isTradeInProgress = false;
+        remainingGil = 0;
+        StatusMessage = message;
+        Log.Information(message);
     }
 
     private void StartNextTrade()
     {
         if (TargetManager.Target == null)
         {
-            ChatGui.Print("No target selected. Please target a player to trade with.");
+            CancelTrade("No target selected. Target a player to continue.");
             return;
         }
         if (isTradeInProgress || remainingGil <= 0) return;
 
         isTradeInProgress = true;
+        StatusMessage = $"Opening trade. {remainingGil:N0} gil remaining.";
         // Trade the player you're targeting
-        Chat.Instance.ExecuteCommand("/trade");
+        Chat.ExecuteCommand("/trade");
 
-        var timer = new System.Timers.Timer(800); // Wait for trade window to open
-        timer.AutoReset = false;
-        timer.Start();
-        timer.Elapsed += (sender, e) =>
+        Schedule(() =>
         {
             int amountToSend = CalculateTradeAmount(remainingGil, MaxTradeAmount);
             remainingGil -= amountToSend;
+            StatusMessage = $"Trading {amountToSend:N0} gil. {remainingGil:N0} remaining.";
             Log.Information($"Trading {amountToSend} gil. Remaining: {remainingGil}");
             TradeAmount(amountToSend);
-        };
+        }, 800);
     }
 
     // Calculate amount to send in current trade
@@ -212,94 +255,155 @@ public sealed class Plugin : IDalamudPlugin
     public unsafe void TradeAmount(int amount)
     {
         // Get the Trade window
-        var tradeAgent = (AgentInterface*)GameGui.FindAgentInterface("Trade");
-        if (tradeAgent == null)
+        var tradeAgentPtr = GameGui.FindAgentInterface("Trade");
+        if (tradeAgentPtr.IsNull)
         {
             Log.Error("Trade window not found.");
             isTradeInProgress = false;
             return;
         }
+        var tradeAgent = (AgentInterface*)tradeAgentPtr.Address;
 
-        var timer = new System.Timers.Timer(300);
-        timer.AutoReset = false;
         // This is a hacky way of specifying the Gil to send and pressing the Trade button.
         var clickatkReturn = new AtkValue { Bool = false };
-        var clickvalues = new AtkValue { Type = FFXIVClientStructs.FFXIV.Component.GUI.ValueType.Int, Int = 2 };
+        var clickvalues = new AtkValue { Type = AtkValueType.Int, Int = 2 };
         tradeAgent->ReceiveEvent(&clickatkReturn, &clickvalues, 2, 0);
 
         var atkReturn = new AtkValue { Bool = true };
-        var values = new AtkValue { Type = FFXIVClientStructs.FFXIV.Component.GUI.ValueType.Int, Int = amount };
+        var values = new AtkValue { Type = AtkValueType.Int, Int = amount };
         tradeAgent->ReceiveEvent(&atkReturn, &values, 1, 1);
 
-        timer.Start();
-        timer.Elapsed += (sender, e) =>
+        Schedule(() =>
         {
+            var currentTradeAgentPtr = GameGui.FindAgentInterface("Trade");
+            if (currentTradeAgentPtr.IsNull)
+            {
+                CancelTrade("Trade window closed before the gil amount could be entered.");
+                return;
+            }
+            var currentTradeAgent = (AgentInterface*)currentTradeAgentPtr.Address;
             var clickCloseatkReturn = new AtkValue { Bool = true };
-            var clickClosevalues = new AtkValue { Type = FFXIVClientStructs.FFXIV.Component.GUI.ValueType.Int, Int = -1 };
-            tradeAgent->ReceiveEvent(&clickCloseatkReturn, &clickClosevalues, 2, 1);
+            var clickClosevalues = new AtkValue { Type = AtkValueType.Int, Int = -1 };
+            currentTradeAgent->ReceiveEvent(&clickCloseatkReturn, &clickClosevalues, 2, 1);
 
             var finalCloseReturn = new AtkValue { Bool = false };
-            var finalCloseValues = new AtkValue { Type = FFXIVClientStructs.FFXIV.Component.GUI.ValueType.Int, Int = 4 };
-            tradeAgent->ReceiveEvent(&finalCloseReturn, &finalCloseValues, 2, 0);
+            var finalCloseValues = new AtkValue { Type = AtkValueType.Int, Int = 4 };
+            currentTradeAgent->ReceiveEvent(&finalCloseReturn, &finalCloseValues, 2, 0);
 
             var inputNumeric = GameGui.GetAddonByName("InputNumeric");
-            new AddonMaster.InputNumeric(inputNumeric).Cancel();
+            if (!inputNumeric.IsNull)
+                new AddonMaster.InputNumeric(inputNumeric.Address).Cancel();
 
-            var checkTimer = new System.Timers.Timer(300);
+            WaitForRecipient();
+        }, 300);
+    }
 
-            checkTimer.Start();
-            checkTimer.Elapsed += (sender, e) =>
+    private unsafe void WaitForRecipient()
+    {
+        var tradeWindowPtr = GameGui.GetAddonByName("Trade");
+        if (tradeWindowPtr.IsNull)
+        {
+            CancelTrade("Trade closed before the recipient confirmed.");
+            return;
+        }
+
+        var tradeWindow = (AtkUnitBase*)tradeWindowPtr.Address;
+        var receiverComponent = NodeUtils.GetAsAtkComponent<AtkComponentBase>(tradeWindow->GetNodeById(5));
+        var receiverOk = receiverComponent->GetTextNodeById(2);
+        if (receiverOk->Alpha_2 <= 200)
+        {
+            Schedule(WaitForRecipient, 300);
+            return;
+        }
+
+        var tradeAgentPtr = GameGui.FindAgentInterface("Trade");
+        if (tradeAgentPtr.IsNull)
+        {
+            CancelTrade("Trade agent disappeared before confirmation.");
+            return;
+        }
+
+        var tradeAgent = (AgentInterface*)tradeAgentPtr.Address;
+        var finalCloseReturn = new AtkValue { Bool = false };
+        var finalCloseValues = new AtkValue { Type = AtkValueType.Int, Int = 0 };
+        tradeAgent->ReceiveEvent(&finalCloseReturn, &finalCloseValues, 2, 0);
+        Schedule(WaitForTradeWindowToClose, 300);
+    }
+
+    private void WaitForTradeWindowToClose()
+    {
+        if (!GameGui.GetAddonByName("Trade").IsNull)
+        {
+            Schedule(WaitForTradeWindowToClose, 300);
+            return;
+        }
+
+        CompleteCurrentTrade();
+    }
+
+    private void CompleteCurrentTrade()
+    {
+        if (!isTradeInProgress)
+            return;
+
+        isTradeInProgress = false;
+        if (remainingGil > 0)
+        {
+            StatusMessage = $"Trade complete. {remainingGil:N0} gil remaining.";
+            Schedule(StartNextTrade, 500);
+            return;
+        }
+
+        StatusMessage = "Gil trading completed successfully.";
+        Log.Information(StatusMessage);
+    }
+
+    private void Schedule(System.Action action, int delayMilliseconds)
+    {
+        var token = tradeCancellation.Token;
+        _ = Framework.RunOnTick(
+            () =>
             {
-                var tradeWindow = (AtkUnitBase*)GameGui.GetAddonByName("Trade");
-                if (tradeWindow == null)
-                {
-                    checkTimer.Stop();
-                    return;
-                }
-                var traderComponent = NodeUtils.GetAsAtkComponent<AtkComponentBase>(tradeWindow->GetNodeById(4));
-                var receiverComponent = NodeUtils.GetAsAtkComponent<AtkComponentBase>(tradeWindow->GetNodeById(5));
-                var receiverOk = receiverComponent->GetTextNodeById(2);
-                var traderOk = traderComponent->GetTextNodeById(2);
-
-                if (receiverOk->Alpha_2 > 200)
-                {
-                    var finalCloseReturn2 = new AtkValue { Bool = false };
-                    var finalCloseValues2 = new AtkValue { Type = FFXIVClientStructs.FFXIV.Component.GUI.ValueType.Int, Int = 0 };
-                    tradeAgent->ReceiveEvent(&finalCloseReturn2, &finalCloseValues2, 2, 0);
-
-                    checkTimer.Stop();
-                }
-            };
-        };
+                if (!token.IsCancellationRequested)
+                    action();
+            },
+            TimeSpan.FromMilliseconds(delayMilliseconds),
+            cancellationToken: token);
     }
 
     public void Dispose()
     {
+        tradeCancellation.Cancel();
+        tradeCancellation.Dispose();
         ECommonsMain.Dispose();
         ChatGui.ChatMessage -= OnChatMessage;
         Framework.Update -= SelectYes;
+        PluginInterface.UiBuilder.Draw -= windowSystem.Draw;
+        PluginInterface.UiBuilder.OpenMainUi -= ToggleMainUi;
+        PluginInterface.UiBuilder.OpenConfigUi -= ToggleMainUi;
+        windowSystem.RemoveAllWindows();
         CommandManager.RemoveHandler("/giltrade");
     }
 
     private unsafe void OnCommand(string command, string args)
     {
-        var currentGil = InventoryManager.Instance()->GetGil();
-        // Get gil amount as argument
-        var validAmount = int.TryParse(args, out var gilAmount);
-        var hasEnoughGil = gilAmount <= currentGil;
-        if (!validAmount || gilAmount == 0)
+        if (string.IsNullOrWhiteSpace(args))
         {
-            Log.Error("Invalid gil amount. Please specify a positive number.");
+            ToggleMainUi();
             return;
         }
-        if (!hasEnoughGil)
+
+        if (!int.TryParse(args.Trim(), out var gilAmount))
         {
-            Log.Information($"You do not have enough gil to start this trade.");
+            StatusMessage = "Enter a whole-number gil amount.";
+            ChatGui.PrintError(StatusMessage);
+            mainWindow.IsOpen = true;
             return;
         }
-        remainingGil = gilAmount;
-        isTradeInProgress = false;
-        Log.Information($"Starting trade sequence for {gilAmount} gil");
-        StartNextTrade();
+
+        if (!TryStartTrade(gilAmount))
+            ChatGui.PrintError(StatusMessage);
     }
+
+    private void ToggleMainUi() => mainWindow.Toggle();
 }

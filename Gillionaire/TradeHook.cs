@@ -16,7 +16,7 @@ namespace Gillionaire
 
         public TradeHook()
         {
-            var agent = (AgentInterface*)Plugin.GameGui.FindAgentInterface("Trade");
+            var agent = (AgentInterface*)Plugin.GameGui.FindAgentInterface("Trade").Address;
             this.receiveEventHook = Plugin.GameInteropProvider.HookFromAddress<ReceiveEventDelegate>(
                 agent->VirtualTable->ReceiveEvent,
                 this.DetourRecieveEvent
