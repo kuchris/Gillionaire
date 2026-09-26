@@ -12,7 +12,7 @@ https://raw.githubusercontent.com/kuchris/DalamudPlugins/main/repo.json
 
 Open `/xlplugins`, find **Gillionaire**, and install it. The same repository also includes XIV AI Chat and MoreMacros. Installation packages for this fork are published under [kuchris/Gillionaire releases](https://github.com/kuchris/Gillionaire/releases).
 
-Original author attribution is retained as `voidstar0`. This fork is maintained separately from the upstream project.
+The plugin installer lists `kuchris` for this fork. The original author and upstream project are credited above.
 
 ## How To Use
 
