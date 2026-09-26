@@ -1,11 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <Project Sdk="Dalamud.NET.Sdk/15.0.0">
   <PropertyGroup>
-    <Version>0.0.0.1</Version>
+    <Version>0.0.0.2</Version>
     <Author>voidstar0</Author>
     <Name>Gillionaire</Name>
     <Punchline>Trading Gil quickly because time is money.</Punchline>
-    <Description>Automate the Gil sending process to send amounts over the maximum using /giltrade &lt;amount&gt;.</Description>
+    <Description>Automate the Gil sending process to send amounts over the maximum using /giltrade &lt;amount&gt;. Fork maintained by kuchris for Dalamud API 15.</Description>
     <RepoUrl>https://github.com/kuchris/Gillionaire</RepoUrl>
     <Tags>gil;trade</Tags>
     <PackageLicenseExpression>AGPL-3.0-or-later</PackageLicenseExpression>
